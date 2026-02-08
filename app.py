@@ -341,3 +341,147 @@ def calc(req: CalcRequest):
         })
 
     return {"rows": rows_out, "totals": totals}
+
+import json
+import uuid
+from datetime import datetime
+
+def _db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_sessions_table():
+    con = _db()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        created_at TEXT,
+        boundary TEXT,
+        payload_json TEXT
+    )
+    """)
+    con.commit()
+    con.close()
+
+@app.on_event("startup")
+def _startup():
+    init_sessions_table()
+
+class SessionStartReq(BaseModel):
+    boundary: str = "consumption"
+    items: List[IngredientIn]  # reuse your IngredientIn (name/amount/unit/boundary)
+
+@app.post("/session/start")
+def session_start(req: SessionStartReq):
+    session_id = str(uuid.uuid4())
+
+    # store an expanded structure so we can keep choices
+    payload = {
+        "boundary": req.boundary,
+        "items": [
+            {
+                "name": it.name,
+                "amount": it.amount,
+                "unit": it.unit,
+                "boundary": it.boundary,
+                "chosen_scenario_id": None
+            }
+            for it in req.items
+        ]
+    }
+
+    con = _db()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO sessions(session_id, created_at, boundary, payload_json) VALUES (?,?,?,?)",
+        (session_id, datetime.utcnow().isoformat(), req.boundary, json.dumps(payload))
+    )
+    con.commit()
+    con.close()
+
+    return {"session_id": session_id}
+
+class SessionChooseReq(BaseModel):
+    session_id: str
+    item_index: int
+    scenario_id: str
+
+@app.post("/session/choose")
+def session_choose(req: SessionChooseReq):
+    con = _db()
+    cur = con.cursor()
+    row = cur.execute("SELECT payload_json FROM sessions WHERE session_id = ?", (req.session_id,)).fetchone()
+    if not row:
+        con.close()
+        return {"ok": False, "error": "session not found"}
+
+    payload = json.loads(row["payload_json"])
+    items = payload.get("items", [])
+
+    if req.item_index < 0 or req.item_index >= len(items):
+        con.close()
+        return {"ok": False, "error": "item_index out of range"}
+
+    items[req.item_index]["chosen_scenario_id"] = req.scenario_id
+    payload["items"] = items
+
+    cur.execute("UPDATE sessions SET payload_json = ? WHERE session_id = ?", (json.dumps(payload), req.session_id))
+    con.commit()
+    con.close()
+    return {"ok": True}
+
+@app.get("/session/result")
+def session_result(session_id: str):
+    con = _db()
+    cur = con.cursor()
+    row = cur.execute("SELECT payload_json FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    if not row:
+        con.close()
+        return {"ok": False, "error": "session not found"}
+
+    payload = json.loads(row["payload_json"])
+    items = payload.get("items", [])
+    boundary = payload.get("boundary", "consumption")
+
+    # check if all chosen
+    if any(it.get("chosen_scenario_id") is None for it in items):
+        con.close()
+        return {"ok": False, "error": "not all items chosen", "items": items}
+
+    # compute totals directly from scenario_id (no rematching!)
+    totals = {"co2": 0.0, "land": 0.0, "water": 0.0}
+    rows_out = []
+
+    for it in items:
+        kg = it["amount"]/1000.0 if str(it["unit"]).lower() == "g" else it["amount"]
+        scenario_id = it["chosen_scenario_id"]
+
+        scen = cur.execute("""
+            SELECT * FROM food_scenarios
+            WHERE scenario_id = ? AND boundary = ?
+        """, (scenario_id, boundary)).fetchone()
+
+        if not scen:
+            rows_out.append({"ingredient": it["name"], "kg": kg, "note": "scenario not found"})
+            continue
+
+        co2 = kg * float(scen["co2_kg_per_kg"])
+        land = kg * float(scen["land_m2a_per_kg"])
+        water = kg * float(scen["water_m3_per_kg"])
+
+        totals["co2"] += co2
+        totals["land"] += land
+        totals["water"] += water
+
+        rows_out.append({
+            "ingredient": it["name"],
+            "kg": kg,
+            "mapped_to": scen["food_name_base"],
+            "variant": scen["variant_name_raw"],
+            "co2": co2, "land": land, "water": water
+        })
+
+    con.close()
+    return {"ok": True, "rows": rows_out, "totals": totals}
