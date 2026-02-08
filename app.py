@@ -4,7 +4,9 @@ import re
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Tuple
-
+import json
+import uuid
+from datetime import datetime
 DB_PATH = "rivm_food.db"
 app = FastAPI()
 
@@ -342,9 +344,7 @@ def calc(req: CalcRequest):
 
     return {"rows": rows_out, "totals": totals}
 
-import json
-import uuid
-from datetime import datetime
+
 
 def _db():
     con = sqlite3.connect(DB_PATH)
