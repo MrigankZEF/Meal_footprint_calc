@@ -67,46 +67,51 @@ def whole_word_contains(text: str, word: str) -> bool:
 # -------------------------
 
 def score_query_against_field(q_tokens: List[str], field_text: str, query_norm: str) -> float:
-    """
-    Score query tokens against a specific field.
-    Returns score in [0, 1.2+] (we will clamp later).
-    """
     if not field_text:
         return 0.0
 
     field_norm = norm_basic(field_text)
-    f_tokens = set(tokenize(field_norm))
+    f_tokens_list = tokenize(field_norm)
+    f_tokens = set(f_tokens_list)
     if not q_tokens or not f_tokens:
         return 0.0
 
     q_set = set(q_tokens)
 
-    # Token overlap (weighted)
+    # recall-ish overlap: how many query tokens matched
     inter = q_set & f_tokens
-    overlap = len(inter) / max(1, len(q_set))  # recall-ish: how many query tokens matched
+    overlap = len(inter) / max(1, len(q_set))
 
-    # Exact match bonus: if normalized query equals normalized field (or equals food_name_base)
+    # exact match bonus
     exact = 1.0 if field_norm == query_norm else 0.0
 
-    # Whole-word contains bonus: if every query token appears as whole word in field
-    contains_all = 1.0
-    for qt in q_set:
-        if not whole_word_contains(field_norm, qt):
-            contains_all = 0.0
-            break
-
-    # Partial contains: fraction of query tokens contained as whole words
+    # contains bonuses
     contains_frac = sum(1.0 for qt in q_set if whole_word_contains(field_norm, qt)) / max(1, len(q_set))
 
-    # Combine
-    # Overlap is the base; exact and contains boost confidence.
+    # IMPORTANT FIX:
+    # Only use "contains_all" bonus when query has >=2 tokens.
+    contains_all = 0.0
+    if len(q_set) >= 2:
+        contains_all = 1.0 if contains_frac == 1.0 else 0.0
+
+    # Start-of-string bonus (very useful for food_name_base like "Tomato")
+    starts = 1.0 if field_norm.startswith(query_norm) else 0.0
+
+    # Penalty for being much longer than query (prevents "herring ... tomato sauce" beating "Tomato")
+    # For single-token queries, this matters most.
+    extra_tokens = max(0, len(f_tokens_list) - len(q_set))
+    length_penalty = 1.0 / (1.0 + 0.20 * extra_tokens)
+
     score = (
-        0.60 * overlap +
-        0.25 * contains_frac +
-        0.15 * contains_all +
-        0.50 * exact
+        0.55 * overlap +
+        0.20 * contains_frac +
+        0.20 * starts +
+        0.50 * exact +
+        0.10 * contains_all
     )
-    return score
+
+    return score * length_penalty
+
 
 def final_score(query: str, row: sqlite3.Row) -> float:
     """
@@ -236,10 +241,23 @@ def match(req: MatchRequest):
             if sid not in cand_by_id:
                 cand_by_id[sid] = r
 
-    # IMPORTANT: if nothing found, return no matches (no random fallback!)
+        # If nothing found with phrase LIKE, fall back to token-based LIKE (deterministic)
+    if not cand_by_id:
+        # try each token separately (OR), but still scoped to boundary
+        toks = tokenize(req.text)
+        # if query is multi-token like "cottage cheese", this will try "%cottage%" and "%cheese%"
+        for tok in toks:
+            rows = fetch_candidate_rows(cur, req.boundary, tok, limit=800)
+            for r in rows:
+                sid = r["scenario_id"]
+                if sid not in cand_by_id:
+                    cand_by_id[sid] = r
+
+    # If still nothing, return empty (no random fallback)
     if not cand_by_id:
         con.close()
         return {"query": req.text, "boundary": req.boundary, "matches": []}
+
 
     scored: List[Tuple[float, str, sqlite3.Row]] = []
     for sid, r in cand_by_id.items():
